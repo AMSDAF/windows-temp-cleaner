@@ -7,17 +7,21 @@ $ErrorActionPreference = "SilentlyContinue"
 $DaysOld = 7
 $CutoffDate = (Get-Date).AddDays(-$DaysOld)
 
-$TempPaths = @(
-    $env:TEMP,
-    "C:\Windows\Temp"
-)
-
 $InstallDirectory = "C:\ProgramData\WindowsTempCleaner"
 $LogFile = Join-Path $InstallDirectory "latest.log"
+
+# Avoid application-managed temporary data.
+$ExcludedPathPatterns = @(
+    "*\OneDrive\*",
+    "*\OfficeFileCache\*",
+    "*\Microsoft Office\*",
+    "*\Microsoft\Office\*"
+)
 
 $EligibleFiles = 0
 $DeletedFiles = 0
 $SkippedFiles = 0
+$ExcludedFiles = 0
 
 $PotentialBytes = [long]0
 $FreedBytes = [long]0
@@ -42,6 +46,107 @@ function Format-FileSize {
     return "$Bytes bytes"
 }
 
+function Test-IsExcludedPath {
+    param(
+        [string]$Path
+    )
+
+    foreach ($Pattern in $ExcludedPathPatterns) {
+        if ($Path -like $Pattern) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+# Scheduled tasks run as SYSTEM, so $env:TEMP would point to the
+# SYSTEM profile instead of the temporary folders of actual users.
+function Get-UserTempDirectories {
+    $ProfileRegistryPath =
+        "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
+
+    $TempDirectories = @()
+
+    $Profiles = Get-ChildItem `
+        -Path $ProfileRegistryPath `
+        -ErrorAction SilentlyContinue
+
+    foreach ($UserProfile in $Profiles) {
+        try {
+            $ProfileData = Get-ItemProperty `
+                -LiteralPath $UserProfile.PSPath `
+                -ErrorAction Stop
+
+            $ProfilePath = $ProfileData.ProfileImagePath
+
+            if ([string]::IsNullOrWhiteSpace($ProfilePath)) {
+                continue
+            }
+
+            $ProfilePath =
+                [Environment]::ExpandEnvironmentVariables($ProfilePath)
+
+            # Ignore Windows service and internal profiles.
+            if ($ProfilePath -like "$env:SystemRoot\*") {
+                continue
+            }
+
+            if (-not (Test-Path -LiteralPath $ProfilePath)) {
+                continue
+            }
+
+            $UserTempPath = Join-Path `
+                $ProfilePath `
+                "AppData\Local\Temp"
+
+            if (-not (Test-Path -LiteralPath $UserTempPath)) {
+                continue
+            }
+
+            $ResolvedProfile = (
+                Resolve-Path -LiteralPath $ProfilePath
+            ).Path.TrimEnd("\")
+
+            $ResolvedTemp = (
+                Resolve-Path -LiteralPath $UserTempPath
+            ).Path.TrimEnd("\")
+
+            $ExpectedTemp = Join-Path `
+                $ResolvedProfile `
+                "AppData\Local\Temp"
+
+            # Only accept the exact Temp directory expected for this profile.
+            if ($ResolvedTemp -ne $ExpectedTemp) {
+                continue
+            }
+
+            $TempDirectories += $ResolvedTemp
+        }
+        catch {
+            continue
+        }
+    }
+
+    return $TempDirectories | Sort-Object -Unique
+}
+
+$TempPaths = @()
+
+foreach ($UserTemp in (Get-UserTempDirectories)) {
+    $TempPaths += $UserTemp
+}
+
+$WindowsTemp = Join-Path $env:SystemRoot "Temp"
+
+if (Test-Path -LiteralPath $WindowsTemp) {
+    $TempPaths += (
+        Resolve-Path -LiteralPath $WindowsTemp
+    ).Path
+}
+
+$TempPaths = $TempPaths | Sort-Object -Unique
+
 Write-Host ""
 Write-Host "Windows Temp Cleaner"
 Write-Host "===================="
@@ -65,7 +170,6 @@ foreach ($Path in $TempPaths) {
 Write-Host ""
 
 foreach ($Path in $TempPaths) {
-
     if (-not (Test-Path -LiteralPath $Path)) {
         continue
     }
@@ -81,6 +185,10 @@ foreach ($Path in $TempPaths) {
         }
 
     foreach ($File in $Files) {
+        if (Test-IsExcludedPath -Path $File.FullName) {
+            $ExcludedFiles++
+            continue
+        }
 
         $EligibleFiles++
         $PotentialBytes += $File.Length
@@ -107,53 +215,68 @@ foreach ($Path in $TempPaths) {
 }
 
 if (-not $DryRun) {
-
     foreach ($Path in $TempPaths) {
-
         if (-not (Test-Path -LiteralPath $Path)) {
             continue
         }
 
-        Get-ChildItem `
+        $Directories = Get-ChildItem `
             -LiteralPath $Path `
             -Directory `
             -Recurse `
             -Force `
             -ErrorAction SilentlyContinue |
-            Sort-Object FullName -Descending |
-            ForEach-Object {
+            Sort-Object {
+                $_.FullName.Length
+            } -Descending
 
-                try {
-                    if (-not (Get-ChildItem -LiteralPath $_.FullName -Force)) {
-                        Remove-Item `
-                            -LiteralPath $_.FullName `
-                            -Force `
-                            -ErrorAction Stop
-                    }
-                }
-                catch {
-                    # Directory is protected, in use, or no longer exists.
+        foreach ($Directory in $Directories) {
+            if (Test-IsExcludedPath -Path $Directory.FullName) {
+                continue
+            }
+
+            # Never remove junctions, symbolic links or other reparse points.
+            if (
+                $Directory.Attributes -band
+                [IO.FileAttributes]::ReparsePoint
+            ) {
+                continue
+            }
+
+            try {
+                $Children = Get-ChildItem `
+                    -LiteralPath $Directory.FullName `
+                    -Force `
+                    -ErrorAction Stop
+
+                if (-not $Children) {
+                    Remove-Item `
+                        -LiteralPath $Directory.FullName `
+                        -Force `
+                        -ErrorAction Stop
                 }
             }
+            catch {
+                # Protected, in use, or already removed.
+            }
+        }
     }
 }
 
 Write-Host "Eligible files: $EligibleFiles"
+Write-Host "Excluded files: $ExcludedFiles"
 Write-Host "Potential space: $(Format-FileSize $PotentialBytes)"
 
 if ($DryRun) {
-
     Write-Host ""
     Write-Host "No files were deleted."
 }
 else {
-
     Write-Host "Deleted files: $DeletedFiles"
     Write-Host "Skipped files: $SkippedFiles"
     Write-Host "Space freed: $(Format-FileSize $FreedBytes)"
 
     try {
-
         if (-not (Test-Path -LiteralPath $InstallDirectory)) {
             New-Item `
                 -ItemType Directory `
@@ -166,7 +289,12 @@ Windows Temp Cleaner
 
 Last cleanup: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
 Files older than: $DaysOld days
+
+Directories scanned:
+$($TempPaths -join "`r`n")
+
 Eligible files: $EligibleFiles
+Excluded files: $ExcludedFiles
 Deleted files: $DeletedFiles
 Skipped files: $SkippedFiles
 Space freed: $(Format-FileSize $FreedBytes)
@@ -178,7 +306,7 @@ Space freed: $(Format-FileSize $FreedBytes)
             -Encoding UTF8
     }
     catch {
-        # Cleanup should not fail just because the log could not be written.
+        # Logging should never prevent cleanup from completing.
     }
 }
 
